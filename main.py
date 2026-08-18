@@ -36,7 +36,8 @@ pool = ConnectionPool(
         f"port={DB_CONFIG['port']} "
         f"dbname={DB_CONFIG['dbname']} "
         f"user={DB_CONFIG['user']} "
-        f"password={DB_CONFIG['password']}"
+        f"password={DB_CONFIG['password']} "
+        f"sslmode={DB_CONFIG['sslmode']}"
     ),
     min_size=1,
     max_size=10,
