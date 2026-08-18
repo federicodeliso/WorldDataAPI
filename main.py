@@ -21,11 +21,12 @@ app.add_middleware(
 )
 
 DB_CONFIG = {
-    "host": "localhost",
-    "port": 5432,
-    "dbname": "worlddata",
-    "user": "postgres",
-    "password": os.getenv("WORLD_DATA_DB_PASSWORD", "YOUR_POSTGRES_PASSWORD")
+    "host": os.getenv("WORLD_DATA_DB_HOST"),
+    "port": int(os.getenv("WORLD_DATA_DB_PORT", "5432")),
+    "dbname": os.getenv("WORLD_DATA_DB_NAME"),
+    "user": os.getenv("WORLD_DATA_DB_USER"),
+    "password": os.getenv("WORLD_DATA_DB_PASSWORD"),
+    "sslmode": os.getenv("WORLD_DATA_DB_SSLMODE", "require")
 }
 
 
@@ -45,12 +46,26 @@ pool = ConnectionPool(
 
 def get_connection():
     return pool.connection()
+
+
 @app.get("/")
 def root():
     return {
         "name": "WorldData API",
         "version": "1.0.0",
         "status": "online"
+    }
+
+
+@app.get("/debug-config")
+def debug_config():
+    return {
+        "host": os.getenv("WORLD_DATA_DB_HOST"),
+        "port": os.getenv("WORLD_DATA_DB_PORT"),
+        "dbname": os.getenv("WORLD_DATA_DB_NAME"),
+        "user": os.getenv("WORLD_DATA_DB_USER"),
+        "sslmode": os.getenv("WORLD_DATA_DB_SSLMODE"),
+        "password_set": bool(os.getenv("WORLD_DATA_DB_PASSWORD"))
     }
 
 
