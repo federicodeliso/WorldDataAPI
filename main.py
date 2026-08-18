@@ -383,6 +383,64 @@ def rankings(
         ]
     }
 
+@app.get("/latest/{indicator}")
+def latest(
+    indicator: str,
+    limit: int = Query(200, ge=1, le=500)
+):
+    query = """
+        SELECT
+            e.name AS country,
+            e.iso3,
+            o.year,
+            o.value
+        FROM observations o
+        JOIN entities e
+            ON o.entity_id = e.entity_id
+        JOIN indicators i
+            ON o.indicator_id = i.indicator_id
+        WHERE i.code = %s
+          AND o.value IS NOT NULL
+          AND o.year = (
+              SELECT MAX(o2.year)
+              FROM observations o2
+              WHERE o2.entity_id = o.entity_id
+                AND o2.indicator_id = o.indicator_id
+                AND o2.value IS NOT NULL
+          )
+        ORDER BY e.name
+        LIMIT %s
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (indicator, limit))
+            rows = cur.fetchall()
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No data found for indicator '{indicator}'."
+        )
+
+    latest_year = max(row[2] for row in rows)
+
+    return {
+        "indicator": indicator,
+        "year": latest_year,
+        "count": len(rows),
+        "results": [
+            {
+                "country": row[0],
+                "iso3": row[1],
+                "year": row[2],
+                "value": row[3]
+            }
+            for row in rows
+        ]
+    }
+
+
 @app.get("/compare/{indicator}")
 def compare(
     indicator: str,
