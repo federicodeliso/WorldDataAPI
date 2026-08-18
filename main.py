@@ -58,17 +58,6 @@ def root():
     }
 
 
-@app.get("/debug-config")
-def debug_config():
-    return {
-        "host": os.getenv("WORLD_DATA_DB_HOST"),
-        "port": os.getenv("WORLD_DATA_DB_PORT"),
-        "dbname": os.getenv("WORLD_DATA_DB_NAME"),
-        "user": os.getenv("WORLD_DATA_DB_USER"),
-        "sslmode": os.getenv("WORLD_DATA_DB_SSLMODE"),
-        "password_set": bool(os.getenv("WORLD_DATA_DB_PASSWORD"))
-    }
-
 
 @app.get("/health")
 def health():
