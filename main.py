@@ -131,7 +131,7 @@ def countries(
 
 @app.get("/indicators")
 def indicators(
-    limit: int = Query(100, ge=1, le=500)
+    limit: int = Query(100, ge=1, le=2000)
 ):
     with get_connection() as conn:
         with conn.cursor() as cur:
