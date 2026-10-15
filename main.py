@@ -1,276 +1,267 @@
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from psycopg_pool import ConnectionPool
+from contextlib import contextmanager
+from pathlib import Path
 import os
-from dotenv import load_dotenv
-
-load_dotenv()
+import sqlite3
 
 app = FastAPI(
     title="WorldData API",
     description="API for the WorldData economic, demographic and fiscal database",
-    version="1.0.0"
+    version="1.1.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://world-data-frontend.vercel.app",
+    ],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-DB_CONFIG = {
-    "host": os.getenv("WORLD_DATA_DB_HOST"),
-    "port": int(os.getenv("WORLD_DATA_DB_PORT", "5432")),
-    "dbname": os.getenv("WORLD_DATA_DB_NAME"),
-    "user": os.getenv("WORLD_DATA_DB_USER"),
-    "password": os.getenv("WORLD_DATA_DB_PASSWORD"),
-    "sslmode": os.getenv("WORLD_DATA_DB_SSLMODE", "require")
-}
+# Set WORLD_DATA_DB_PATH to the absolute path of worlddata.db.
+# Default: worlddata.db in the same directory as this file.
+DB_PATH = Path(
+    os.getenv(
+        "WORLD_DATA_DB_PATH",
+        str(Path(__file__).resolve().parent / "worlddata.db"),
+    )
+).resolve()
 
 
-pool = ConnectionPool(
-    conninfo=(
-        f"host={DB_CONFIG['host']} "
-        f"port={DB_CONFIG['port']} "
-        f"dbname={DB_CONFIG['dbname']} "
-        f"user={DB_CONFIG['user']} "
-        f"password={DB_CONFIG['password']} "
-        f"sslmode={DB_CONFIG['sslmode']}"
-    ),
-    min_size=1,
-    max_size=10,
-    open=True
-)
-
-
+@contextmanager
 def get_connection():
-    return pool.connection()
+    if not DB_PATH.is_file():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "SQLite database file not found. "
+                "Configure WORLD_DATA_DB_PATH and ensure the file "
+                "is available to the running service."
+            ),
+        )
+
+    conn = None
+    try:
+        conn = sqlite3.connect(
+            f"file:{DB_PATH.as_posix()}?mode=ro",
+            uri=True,
+            timeout=30,
+        )
+        conn.row_factory = sqlite3.Row
+        yield conn
+    except sqlite3.Error as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"SQLite database error: {exc}",
+        )
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def rows_as_dicts(rows):
+    return [dict(row) for row in rows]
 
 
 @app.get("/")
 def root():
     return {
         "name": "WorldData API",
-        "version": "1.0.0",
-        "status": "online"
+        "version": "1.1.0",
+        "status": "online",
     }
-
 
 
 @app.get("/health")
 def health():
-    try:
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                cur.fetchone()
+    with get_connection() as conn:
+        conn.execute("SELECT 1").fetchone()
+    return {
+        "status": "healthy",
+        "database": "connected",
+        "database_type": "SQLite",
+    }
 
-        return {
-            "status": "healthy",
-            "database": "connected"
-        }
 
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Database connection failed: {str(e)}"
-        )
+@app.get("/schema")
+def schema():
+    """List the actual tables in the SQLite database."""
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT name, type
+            FROM sqlite_master
+            WHERE type IN ('table', 'view')
+              AND name NOT LIKE 'sqlite_%'
+            ORDER BY name
+        """).fetchall()
+
+    return {"database": DB_PATH.name, "tables": rows_as_dicts(rows)}
+
+
+@app.get("/schema/{table}")
+def table_schema(table: str):
+    """Show columns for a table, useful for mapping your actual schema."""
+    with get_connection() as conn:
+        exists = conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type IN ('table', 'view') AND name = ?
+            """,
+            (table,),
+        ).fetchone()
+
+        if not exists:
+            raise HTTPException(status_code=404, detail="Table not found.")
+
+        # PRAGMA cannot bind a table name; verify it exists above and quote it.
+        safe_table = '"' + table.replace('"', '""') + '"'
+        rows = conn.execute(
+            f"PRAGMA table_info({safe_table})"
+        ).fetchall()
+
+    return {"table": table, "columns": rows_as_dicts(rows)}
 
 
 @app.get("/stats")
 def stats():
+    # These table names must exist in the SQLite file.
     with get_connection() as conn:
-        with conn.cursor() as cur:
+        tables = {
+            row["name"]
+            for row in conn.execute("""
+                SELECT name FROM sqlite_master WHERE type = 'table'
+            """).fetchall()
+        }
 
-            cur.execute("SELECT COUNT(*) FROM entities")
-            entities = cur.fetchone()[0]
+        required = {"entities", "indicators", "observations"}
+        missing = required - tables
+        if missing:
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "The SQLite schema differs from the expected API schema. "
+                    f"Missing tables: {', '.join(sorted(missing))}. "
+                    "Use /schema to inspect the database."
+                ),
+            )
 
-            cur.execute("SELECT COUNT(*) FROM indicators")
-            indicators = cur.fetchone()[0]
-
-            cur.execute("SELECT COUNT(*) FROM observations")
-            observations = cur.fetchone()[0]
-
-            cur.execute("SELECT MIN(year), MAX(year) FROM observations")
-            min_year, max_year = cur.fetchone()
+        entities = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+        indicators = conn.execute("SELECT COUNT(*) FROM indicators").fetchone()[0]
+        observations = conn.execute(
+            "SELECT COUNT(*) FROM observations"
+        ).fetchone()[0]
+        years = conn.execute(
+            "SELECT MIN(year), MAX(year) FROM observations"
+        ).fetchone()
 
     return {
         "entities": entities,
         "indicators": indicators,
         "observations": observations,
-        "min_year": min_year,
-        "max_year": max_year
+        "min_year": years[0],
+        "max_year": years[1],
     }
 
 
 @app.get("/countries")
-def countries(
-    limit: int = Query(50, ge=1, le=500)
-):
+def countries(limit: int = Query(50, ge=1, le=500)):
     with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT entity_id, name
-                FROM entities
-                ORDER BY name
-                LIMIT %s
-            """, (limit,))
+        rows = conn.execute(
+            """
+            SELECT entity_id, name
+            FROM entities
+            ORDER BY name
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
 
-            rows = cur.fetchall()
-
-    return [
-        {
-            "entity_id": row[0],
-            "name": row[1]
-        }
-        for row in rows
-    ]
+    return rows_as_dicts(rows)
 
 
 @app.get("/indicators")
-def indicators(
-    limit: int = Query(100, ge=1, le=2000)
-):
+def indicators(limit: int = Query(100, ge=1, le=2000)):
     with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    indicator_id,
-                    code,
-                    name,
-                    description,
-                    unit,
-                    frequency,
-                    category
-                FROM indicators
-                ORDER BY code
-                LIMIT %s
-            """, (limit,))
+        rows = conn.execute(
+            """
+            SELECT indicator_id, code, name, description,
+                   unit, frequency, category
+            FROM indicators
+            ORDER BY code
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
 
-            rows = cur.fetchall()
+    return rows_as_dicts(rows)
 
-    return [
-        {
-            "indicator_id": row[0],
-            "code": row[1],
-            "name": row[2],
-            "description": row[3],
-            "unit": row[4],
-            "frequency": row[5],
-            "category": row[6]
-        }
-        for row in rows
-    ]
 
 @app.get("/indicators/{code}")
 def indicator_detail(code: str):
     with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    i.indicator_id,
-                    i.code,
-                    i.name,
-                    i.description,
-                    i.unit,
-                    i.frequency,
-                    i.category,
-                    s.name AS source_name,
-                    s.organization AS source_organization,
-                    s.url AS source_url
-                FROM indicators i
-                LEFT JOIN sources s
-                    ON i.source_id = s.source_id
-                WHERE i.code = %s
-            """, (code,))
+        row = conn.execute(
+            """
+            SELECT i.indicator_id, i.code, i.name, i.description,
+                   i.unit, i.frequency, i.category,
+                   s.name AS source_name,
+                   s.organization AS source_organization,
+                   s.url AS source_url
+            FROM indicators i
+            LEFT JOIN sources s ON i.source_id = s.source_id
+            WHERE i.code = ?
+            """,
+            (code,),
+        ).fetchone()
 
-            row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Indicator not found.")
 
-    if not row:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Indicator '{code}' not found."
-        )
-
-    return {
-        "indicator_id": row[0],
-        "code": row[1],
-        "name": row[2],
-        "description": row[3],
-        "unit": row[4],
-        "frequency": row[5],
-        "category": row[6],
-        "source": {
-            "name": row[7],
-            "organization": row[8],
-            "url": row[9]
-        }
+    result = dict(row)
+    result["source"] = {
+        "name": result.pop("source_name"),
+        "organization": result.pop("source_organization"),
+        "url": result.pop("source_url"),
     }
+    return result
 
 
 @app.get("/countries/{country}")
 def country_detail(country: str):
     with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    e.entity_id,
-                    e.name,
-                    e.iso2,
-                    e.iso3,
-                    e.region,
-                    e.subregion,
-                    e.income_group
-                FROM entities e
-                WHERE e.name = %s
-            """, (country,))
+        row = conn.execute(
+            """
+            SELECT entity_id, name, iso2, iso3, region,
+                   subregion, income_group
+            FROM entities
+            WHERE name = ?
+            """,
+            (country,),
+        ).fetchone()
 
-            row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Country/entity not found.")
 
-    if not row:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Country or entity '{country}' not found."
-        )
-
-    return {
-        "entity_id": row[0],
-        "name": row[1],
-        "iso2": row[2],
-        "iso3": row[3],
-        "region": row[4],
-        "subregion": row[5],
-        "income_group": row[6]
-    }
+    return dict(row)
 
 
 @app.get("/categories")
 def categories():
     with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    category,
-                    COUNT(*) AS indicator_count
-                FROM indicators
-                WHERE category IS NOT NULL
-                  AND category <> ''
-                GROUP BY category
-                ORDER BY category
-            """)
+        rows = conn.execute(
+            """
+            SELECT category, COUNT(*) AS indicator_count
+            FROM indicators
+            WHERE category IS NOT NULL AND category <> ''
+            GROUP BY category
+            ORDER BY category
+            """
+        ).fetchall()
 
-            rows = cur.fetchall()
-
-    return [
-        {
-            "category": row[0],
-            "indicator_count": row[1]
-        }
-        for row in rows
-    ]
-
+    return rows_as_dicts(rows)
 
 
 @app.get("/data/{country}/{indicator}")
@@ -278,92 +269,64 @@ def data(
     country: str,
     indicator: str,
     start_year: int | None = None,
-    end_year: int | None = None
+    end_year: int | None = None,
 ):
     query = """
-        SELECT
-            e.name AS country,
-            i.code AS indicator,
-            o.year,
-            o.value
+        SELECT e.name AS country, i.code AS indicator, o.year, o.value
         FROM observations o
-        JOIN entities e
-            ON o.entity_id = e.entity_id
-        JOIN indicators i
-            ON o.indicator_id = i.indicator_id
-        WHERE e.name = %s
-          AND i.code = %s
+        JOIN entities e ON o.entity_id = e.entity_id
+        JOIN indicators i ON o.indicator_id = i.indicator_id
+        WHERE e.name = ? AND i.code = ?
     """
-
     params = [country, indicator]
 
     if start_year is not None:
-        query += " AND o.year >= %s"
+        query += " AND o.year >= ?"
         params.append(start_year)
-
     if end_year is not None:
-        query += " AND o.year <= %s"
+        query += " AND o.year <= ?"
         params.append(end_year)
 
     query += " ORDER BY o.year"
 
     with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, params)
-            rows = cur.fetchall()
+        rows = conn.execute(query, params).fetchall()
 
     if not rows:
         raise HTTPException(
             status_code=404,
-            detail="No data found for this country and indicator."
+            detail="No data found for this country and indicator.",
         )
 
-    return [
-        {
-            "country": row[0],
-            "indicator": row[1],
-            "year": row[2],
-            "value": row[3]
-        }
-        for row in rows
-    ]
+    return rows_as_dicts(rows)
+
 
 @app.get("/rankings/{indicator}")
 def rankings(
     indicator: str,
     year: int,
     order: str = Query("desc", pattern="^(asc|desc)$"),
-    limit: int = Query(20, ge=1, le=500)
+    limit: int = Query(20, ge=1, le=500),
 ):
     sort_order = "DESC" if order == "desc" else "ASC"
 
     query = f"""
-        SELECT
-            e.name AS country,
-            e.iso3,
-            o.year,
-            o.value
+        SELECT e.name AS country, e.iso3, o.year, o.value
         FROM observations o
-        JOIN entities e
-            ON o.entity_id = e.entity_id
-        JOIN indicators i
-            ON o.indicator_id = i.indicator_id
-        WHERE i.code = %s
-          AND o.year = %s
-          AND o.value IS NOT NULL
+        JOIN entities e ON o.entity_id = e.entity_id
+        JOIN indicators i ON o.indicator_id = i.indicator_id
+        WHERE i.code = ? AND o.year = ? AND o.value IS NOT NULL
         ORDER BY o.value {sort_order}
-        LIMIT %s
+        LIMIT ?
     """
 
     with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, (indicator, year, limit))
-            rows = cur.fetchall()
+        rows = conn.execute(query, (indicator, year, limit)).fetchall()
 
     if not rows:
         raise HTTPException(
             status_code=404,
-            detail=f"No data found for indicator '{indicator}' in {year}."
+            detail=f"No data found for indicator '{indicator}' in {year}.",
         )
 
     return {
@@ -372,34 +335,20 @@ def rankings(
         "order": order,
         "count": len(rows),
         "results": [
-            {
-                "rank": index + 1,
-                "country": row[0],
-                "iso3": row[1],
-                "year": row[2],
-                "value": row[3]
-            }
+            {"rank": index + 1, **dict(row)}
             for index, row in enumerate(rows)
-        ]
+        ],
     }
 
+
 @app.get("/latest/{indicator}")
-def latest(
-    indicator: str,
-    limit: int = Query(200, ge=1, le=500)
-):
+def latest(indicator: str, limit: int = Query(200, ge=1, le=500)):
     query = """
-        SELECT
-            e.name AS country,
-            e.iso3,
-            o.year,
-            o.value
+        SELECT e.name AS country, e.iso3, o.year, o.value
         FROM observations o
-        JOIN entities e
-            ON o.entity_id = e.entity_id
-        JOIN indicators i
-            ON o.indicator_id = i.indicator_id
-        WHERE i.code = %s
+        JOIN entities e ON o.entity_id = e.entity_id
+        JOIN indicators i ON o.indicator_id = i.indicator_id
+        WHERE i.code = ?
           AND o.value IS NOT NULL
           AND o.year = (
               SELECT MAX(o2.year)
@@ -409,35 +358,24 @@ def latest(
                 AND o2.value IS NOT NULL
           )
         ORDER BY e.name
-        LIMIT %s
+        LIMIT ?
     """
 
     with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, (indicator, limit))
-            rows = cur.fetchall()
+        rows = conn.execute(query, (indicator, limit)).fetchall()
 
     if not rows:
         raise HTTPException(
             status_code=404,
-            detail=f"No data found for indicator '{indicator}'."
+            detail=f"No data found for indicator '{indicator}'.",
         )
 
-    latest_year = max(row[2] for row in rows)
-
+    results = rows_as_dicts(rows)
     return {
         "indicator": indicator,
-        "year": latest_year,
-        "count": len(rows),
-        "results": [
-            {
-                "country": row[0],
-                "iso3": row[1],
-                "year": row[2],
-                "value": row[3]
-            }
-            for row in rows
-        ]
+        "year": max(row["year"] for row in results),
+        "count": len(results),
+        "results": results,
     }
 
 
@@ -446,75 +384,23 @@ def compare(
     indicator: str,
     countries: str,
     start_year: int | None = None,
-    end_year: int | None = None
+    end_year: int | None = None,
 ):
-    country_list = [
-        country.strip()
-        for country in countries.split(",")
-        if country.strip()
-    ]
-
+    country_list = [c.strip() for c in countries.split(",") if c.strip()]
     if not country_list:
         raise HTTPException(
             status_code=400,
-            detail="At least one country/entity must be provided."
+            detail="At least one country/entity must be provided.",
         )
 
-    query = """
-        SELECT
-            e.name AS country,
-            e.iso3,
-            o.year,
-            o.value
+    placeholders = ",".join("?" for _ in country_list)
+    query = f"""
+        SELECT e.name AS country, e.iso3, o.year, o.value
         FROM observations o
-        JOIN entities e
-            ON o.entity_id = e.entity_id
-        JOIN indicators i
-            ON o.indicator_id = i.indicator_id
-        WHERE i.code = %s
-          AND e.name = ANY(%s)
+        JOIN entities e ON o.entity_id = e.entity_id
+        JOIN indicators i ON o.indicator_id = i.indicator_id
+        WHERE i.code = ? AND e.name IN ({placeholders})
     """
+    params = [indicator, *country_list]
 
-    params = [indicator, country_list]
-
-    if start_year is not None:
-        query += " AND o.year >= %s"
-        params.append(start_year)
-
-    if end_year is not None:
-        query += " AND o.year <= %s"
-        params.append(end_year)
-
-    query += " ORDER BY e.name, o.year"
-
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, params)
-            rows = cur.fetchall()
-
-    if not rows:
-        raise HTTPException(
-            status_code=404,
-            detail="No data found for the requested comparison."
-        )
-
-    return {
-        "indicator": indicator,
-        "countries_requested": country_list,
-        "start_year": start_year,
-        "end_year": end_year,
-        "count": len(rows),
-        "results": [
-            {
-                "country": row[0],
-                "iso3": row[1],
-                "year": row[2],
-                "value": row[3]
-            }
-            for row in rows
-        ]
-    }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    if start_year is not None
